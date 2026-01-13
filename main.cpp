@@ -12,6 +12,15 @@
 #include <rtc_base/thread.h>
 #include <system_wrappers/include/field_trial.h>
 
+#include "TinyJson.hpp"
+
+// --- Data Structures ---
+struct Ice {
+  std::string candidate;
+  std::string sdp_mid;
+  int sdp_mline_index;
+};
+
 // --- Observer Classes ---
 class Wrapper;
 class PeerConnectionObserverProcy : public webrtc::PeerConnectionObserver {
@@ -51,9 +60,7 @@ public:
       webrtc::PeerConnectionInterface::IceGatheringState new_state) override {
     std::cout << "[PCO] IceGatheringState Change: " << new_state << std::endl;
   }
-  void OnIceCandidate(const webrtc::IceCandidateInterface *candidate) override {
-    std::cout << "[PCO] IceCandidate found!" << std::endl;
-  }
+  void OnIceCandidate(const webrtc::IceCandidateInterface *candidate) override;
 };
 
 class CreateSessionDescriptionObserverProxy
@@ -96,6 +103,7 @@ public:
   rtc::scoped_refptr<SetSessionDescriptionObserverProxy> ssdo;
 
   std::function<void(const std::string &)> on_sdp_callback;
+  std::function<void(const Ice &)> on_ice_callback;
 
   Wrapper() {
     csdo =
@@ -135,6 +143,9 @@ public:
   void create_offer() {
     std::cout << "Creating Offer..." << std::endl;
     webrtc::PeerConnectionInterface::RTCConfiguration config;
+    webrtc::PeerConnectionInterface::IceServer ice_server;
+    ice_server.uri = "stun:stun.l.google.com:19302";
+    config.servers.push_back(ice_server);
 
     pc = pcf->CreatePeerConnection(config, nullptr, nullptr, &pco);
     if (!pc) {
@@ -149,7 +160,15 @@ public:
   void create_answer(const std::string &remote_sdp) {
     std::cout << "Creating Answer..." << std::endl;
     webrtc::PeerConnectionInterface::RTCConfiguration config;
+    webrtc::PeerConnectionInterface::IceServer ice_server;
+    ice_server.uri = "stun:stun.l.google.com:19302";
+    config.servers.push_back(ice_server);
+
     pc = pcf->CreatePeerConnection(config, nullptr, nullptr, &pco);
+    if (!pc) {
+      std::cerr << "Failed to create PeerConnection!" << std::endl;
+      return;
+    }
 
     webrtc::SdpParseError error;
     webrtc::SessionDescriptionInterface *session_desc =
@@ -180,12 +199,38 @@ public:
     pc->SetRemoteDescription(ssdo, session_desc);
   }
 
+  void add_ice_candidate(const Ice &ice_it) {
+    webrtc::SdpParseError error;
+    webrtc::IceCandidateInterface *ice = webrtc::CreateIceCandidate(
+        ice_it.sdp_mid, ice_it.sdp_mline_index, ice_it.candidate, &error);
+
+    if (!ice) {
+      std::cerr << "Failed to create IceCandidate: " << error.description
+                << std::endl;
+      return;
+    }
+
+    if (!pc->AddIceCandidate(ice)) {
+      std::cerr << "Failed to add ICE candidate" << std::endl;
+    }
+  }
+
   void on_local_sdp_ready(webrtc::SessionDescriptionInterface *desc) {
     std::string sdp;
     desc->ToString(&sdp);
     pc->SetLocalDescription(ssdo, desc);
     if (on_sdp_callback) {
       on_sdp_callback(sdp);
+    }
+  }
+
+  void on_local_ice_ready(const webrtc::IceCandidateInterface *candidate) {
+    Ice ice;
+    candidate->ToString(&ice.candidate);
+    ice.sdp_mid = candidate->sdp_mid();
+    ice.sdp_mline_index = candidate->sdp_mline_index();
+    if (on_ice_callback) {
+      on_ice_callback(ice);
     }
   }
 
@@ -201,6 +246,12 @@ public:
     signaling_thread->Stop();
   }
 };
+
+void PeerConnectionObserverProcy::OnIceCandidate(
+    const webrtc::IceCandidateInterface *candidate) {
+  std::cout << "[PCO] IceCandidate found!" << std::endl;
+  parent.on_local_ice_ready(candidate);
+}
 
 void CreateSessionDescriptionObserverProxy::OnSuccess(
     webrtc::SessionDescriptionInterface *desc) {
@@ -218,7 +269,11 @@ int main(int argc, char *argv[]) {
   std::cout << "--- WebRTC C++ Reconstruction ---" << std::endl;
 
   Wrapper rtc_wrapper;
-  rtc_wrapper.init();
+  std::list<Ice> local_ice_list;
+
+  rtc_wrapper.on_ice_callback = [&](const Ice &ice) {
+    local_ice_list.push_back(ice);
+  };
 
   rtc_wrapper.on_sdp_callback = [](const std::string &sdp) {
     std::cout << "\n--- SDP START ---" << std::endl;
@@ -226,8 +281,11 @@ int main(int argc, char *argv[]) {
     std::cout << "--- SDP END ---\n" << std::endl;
   };
 
+  rtc_wrapper.init();
+
   std::cout
-      << "Commands: 'sdp1' (Offer), 'sdp2' (Answer), 'sdp3' (SetAnswer), 'quit'"
+      << "Commands: 'sdp1' (Offer), 'sdp2' (Answer), 'sdp3' (SetAnswer),\n"
+      << "          'ice1' (Show Local ICE), 'ice2' (Add Remote ICE), 'quit'"
       << std::endl;
 
   std::string line;
@@ -241,19 +299,50 @@ int main(int argc, char *argv[]) {
         break;
       if (line == "sdp1") {
         rtc_wrapper.create_offer();
-      } else if (line == "sdp2" || line == "sdp3") {
+      } else if (line == "ice1") {
+        auto ice_arr = tinyjson::Value::array();
+        for (const auto &ice : local_ice_list) {
+          auto ice_obj = tinyjson::Value::object();
+          ice_obj.set("candidate", ice.candidate);
+          ice_obj.set("sdp_mid", ice.sdp_mid);
+          ice_obj.set("sdp_mline_index", ice.sdp_mline_index);
+          ice_arr.push(ice_obj);
+        }
+        std::cout << "\n--- ICE CANDIDATES START ---\n"
+                  << ice_arr.serialize() << "\n--- ICE CANDIDATES END ---\n"
+                  << std::endl;
+        local_ice_list.clear();
+      } else if (line == "sdp2" || line == "sdp3" || line == "ice2") {
         command = line;
         collecting_param = true;
         parameter = "";
-        std::cout << "Pated SDP then type ';' on a new line:" << std::endl;
+        std::cout << "Paste parameter then type ';' on a new line:"
+                  << std::endl;
       }
     } else {
       if (line == ";") {
         collecting_param = false;
-        if (command == "sdp2") {
+        if (command == "sdp2")
           rtc_wrapper.create_answer(parameter);
-        } else if (command == "sdp3") {
+        else if (command == "sdp3")
           rtc_wrapper.set_remote_answer(parameter);
+        else if (command == "ice2") {
+          tinyjson::Parser parser;
+          tinyjson::Value v = parser.parse(parameter);
+          if (v.type() == tinyjson::Type::Array) {
+            const auto &arr = std::get<tinyjson::Array>(v.data);
+            for (const auto &item : arr) {
+              if (item.type() == tinyjson::Type::Object) {
+                const auto &obj = std::get<tinyjson::Object>(item.data);
+                Ice ice;
+                ice.candidate = std::get<std::string>(obj.at("candidate").data);
+                ice.sdp_mid = std::get<std::string>(obj.at("sdp_mid").data);
+                ice.sdp_mline_index = static_cast<int>(
+                    std::get<double>(obj.at("sdp_mline_index").data));
+                rtc_wrapper.add_ice_candidate(ice);
+              }
+            }
+          }
         }
       } else {
         parameter += line + "\n";
