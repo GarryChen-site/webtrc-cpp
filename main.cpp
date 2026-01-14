@@ -3,9 +3,9 @@
 #include <memory>
 #include <string>
 #include <thread>
-#include <vector>
 
 // WebRTC related headers
+#include "api/data_channel_interface.h"
 #include <api/create_peerconnection_factory.h>
 #include <api/peer_connection_interface.h>
 #include <rtc_base/ssl_adapter.h>
@@ -23,6 +23,17 @@ struct Ice {
 
 // --- Observer Classes ---
 class Wrapper;
+
+class DataChannelObserverProxy : public webrtc::DataChannelObserver {
+  Wrapper &parent;
+
+public:
+  DataChannelObserverProxy(Wrapper &p) : parent(p) {}
+
+  void OnStateChange() override;
+  void OnMessage(const webrtc::DataBuffer &buffer) override;
+  void OnBufferedAmountChange(uint64_t previous_amount) override {}
+};
 class PeerConnectionObserverProcy : public webrtc::PeerConnectionObserver {
   Wrapper &parent;
 
@@ -44,9 +55,7 @@ public:
   };
 
   void OnDataChannel(
-      rtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override {
-    std::cout << "[PCO] DataChannel received!" << std::endl;
-  }
+      rtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override;
 
   void OnRenegotiationNeeded() override {
     std::cout << "[PCO] Renegotiation needed!" << std::endl;
@@ -54,11 +63,53 @@ public:
 
   void OnIceConnectionChange(
       webrtc::PeerConnectionInterface::IceConnectionState new_state) override {
-    std::cout << "[PCO] IceConnectionState Change: " << new_state << std::endl;
+    const char *state_str = "Unknown";
+    switch (new_state) {
+    case webrtc::PeerConnectionInterface::kIceConnectionNew:
+      state_str = "New";
+      break;
+    case webrtc::PeerConnectionInterface::kIceConnectionChecking:
+      state_str = "Checking";
+      break;
+    case webrtc::PeerConnectionInterface::kIceConnectionConnected:
+      state_str = "Connected";
+      break;
+    case webrtc::PeerConnectionInterface::kIceConnectionCompleted:
+      state_str = "Completed";
+      break;
+    case webrtc::PeerConnectionInterface::kIceConnectionFailed:
+      state_str = "Failed";
+      break;
+    case webrtc::PeerConnectionInterface::kIceConnectionDisconnected:
+      state_str = "Disconnected";
+      break;
+    case webrtc::PeerConnectionInterface::kIceConnectionClosed:
+      state_str = "Closed";
+      break;
+    default:
+      break;
+    }
+    std::cout << "[PCO] IceConnectionState Change: " << state_str << " ("
+              << new_state << ")" << std::endl;
   }
   void OnIceGatheringChange(
       webrtc::PeerConnectionInterface::IceGatheringState new_state) override {
-    std::cout << "[PCO] IceGatheringState Change: " << new_state << std::endl;
+    const char *state_str = "Unknown";
+    switch (new_state) {
+    case webrtc::PeerConnectionInterface::kIceGatheringNew:
+      state_str = "New";
+      break;
+    case webrtc::PeerConnectionInterface::kIceGatheringGathering:
+      state_str = "Gathering";
+      break;
+    case webrtc::PeerConnectionInterface::kIceGatheringComplete:
+      state_str = "Complete";
+      break;
+    default:
+      break;
+    }
+    std::cout << "[PCO] IceGatheringState Change: " << state_str << " ("
+              << new_state << ")" << std::endl;
   }
   void OnIceCandidate(const webrtc::IceCandidateInterface *candidate) override;
 };
@@ -96,9 +147,11 @@ public:
   std::unique_ptr<rtc::Thread> signaling_thread;
   rtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> pcf;
   rtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
+  rtc::scoped_refptr<webrtc::DataChannelInterface> dc;
 
   // Observers
   PeerConnectionObserverProcy pco{*this};
+  DataChannelObserverProxy dco{*this};
   rtc::scoped_refptr<CreateSessionDescriptionObserverProxy> csdo;
   rtc::scoped_refptr<SetSessionDescriptionObserverProxy> ssdo;
 
@@ -153,6 +206,11 @@ public:
       return;
     }
 
+    // Create DataChannel
+    webrtc::DataChannelInit dc_config;
+    dc = pc->CreateDataChannel("sample_channel", &dc_config);
+    dc->RegisterObserver(&dco);
+
     pc->CreateOffer(csdo,
                     webrtc::PeerConnectionInterface::RTCOfferAnswerOptions());
   }
@@ -205,14 +263,25 @@ public:
         ice_it.sdp_mid, ice_it.sdp_mline_index, ice_it.candidate, &error);
 
     if (!ice) {
-      std::cerr << "Failed to create IceCandidate: " << error.description
-                << std::endl;
+      std::cerr << "[Wrapper] Failed to create ICE candidate: "
+                << error.description << std::endl;
       return;
     }
-
     if (!pc->AddIceCandidate(ice)) {
-      std::cerr << "Failed to add ICE candidate" << std::endl;
+      std::cerr << "[Wrapper] Failed to add ICE candidate" << std::endl;
+    } else {
+      std::cout << "[Wrapper] Successfully added remote ICE candidate."
+                << std::endl;
     }
+  }
+
+  void send_message(const std::string &msg) {
+    if (!dc || dc->state() != webrtc::DataChannelInterface::kOpen) {
+      std::cerr << "DataChannel is not open!" << std::endl;
+      return;
+    }
+    webrtc::DataBuffer buffer(msg);
+    dc->Send(buffer);
   }
 
   void on_local_sdp_ready(webrtc::SessionDescriptionInterface *desc) {
@@ -236,6 +305,10 @@ public:
 
   void cleanup() {
     std::cout << "Cleaning up Wrapper..." << std::endl;
+    if (dc) {
+      dc->UnregisterObserver();
+      dc = nullptr;
+    }
     if (pc) {
       pc->Close();
     }
@@ -253,10 +326,49 @@ void PeerConnectionObserverProcy::OnIceCandidate(
   parent.on_local_ice_ready(candidate);
 }
 
+void PeerConnectionObserverProcy::OnDataChannel(
+    rtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) {
+  std::cout << "[PCO] DataChannel received!" << std::endl;
+  parent.dc = data_channel;
+  parent.dc->RegisterObserver(&parent.dco);
+}
+
 void CreateSessionDescriptionObserverProxy::OnSuccess(
     webrtc::SessionDescriptionInterface *desc) {
   std::cout << "[CSDO] Success (Description Created)" << std::endl;
   parent.on_local_sdp_ready(desc);
+}
+
+void DataChannelObserverProxy::OnStateChange() {
+  if (parent.dc) {
+    const char *state_str = "Unknown";
+    switch (parent.dc->state()) {
+    case webrtc::DataChannelInterface::kConnecting:
+      state_str = "Connecting";
+      break;
+    case webrtc::DataChannelInterface::kOpen:
+      state_str = "Open";
+      break;
+    case webrtc::DataChannelInterface::kClosing:
+      state_str = "Closing";
+      break;
+    case webrtc::DataChannelInterface::kClosed:
+      state_str = "Closed";
+      break;
+    }
+    std::cout << "[DCO] DataChannel State Change: " << state_str << std::endl;
+    if (parent.dc->state() == webrtc::DataChannelInterface::kOpen) {
+      std::cout
+          << "\n>>> CONNECTION READY! You can now use the 'send' command <<<\n"
+          << std::endl;
+    }
+  }
+}
+
+void DataChannelObserverProxy::OnMessage(const webrtc::DataBuffer &buffer) {
+  std::string msg(reinterpret_cast<const char *>(buffer.data.data()),
+                  buffer.data.size());
+  std::cout << "\n[DCO] Received Message: " << msg << std::endl;
 }
 
 // --- Main Program ---
@@ -285,8 +397,8 @@ int main(int argc, char *argv[]) {
 
   std::cout
       << "Commands: 'sdp1' (Offer), 'sdp2' (Answer), 'sdp3' (SetAnswer),\n"
-      << "          'ice1' (Show Local ICE), 'ice2' (Add Remote ICE), 'quit'"
-      << std::endl;
+      << "          'ice1' (Show Local ICE), 'ice2' (Add Remote ICE),\n"
+      << "          'send' (Send Message), 'quit'" << std::endl;
 
   std::string line;
   std::string command;
@@ -312,15 +424,22 @@ int main(int argc, char *argv[]) {
                   << ice_arr.serialize() << "\n--- ICE CANDIDATES END ---\n"
                   << std::endl;
         local_ice_list.clear();
-      } else if (line == "sdp2" || line == "sdp3" || line == "ice2") {
+      } else if (line == "sdp2" || line == "sdp3" || line == "ice2" ||
+                 line == "send") {
         command = line;
         collecting_param = true;
         parameter = "";
-        std::cout << "Paste parameter then type ';' on a new line:"
-                  << std::endl;
+        if (line == "send")
+          std::cout << "Enter message: ";
+        else
+          std::cout << "Paste parameter then type ';' on a new line:"
+                    << std::endl;
       }
     } else {
-      if (line == ";") {
+      if (command == "send") {
+        rtc_wrapper.send_message(line);
+        collecting_param = false;
+      } else if (line == ";") {
         collecting_param = false;
         if (command == "sdp2")
           rtc_wrapper.create_answer(parameter);
