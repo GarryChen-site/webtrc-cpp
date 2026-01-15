@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>WebRTC C++ Sample - Browser Peer</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: #0f172a;
+            color: #f8fafc;
+            max-width: 800px;
+            margin: 20px auto;
+            padding: 20px;
+        }
+
+        h1 {
+            color: #38bdf8;
+            border-bottom: 2px solid #1e293b;
+            padding-bottom: 10px;
+        }
+
+        .section {
+            background: #1e293b;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border: 1px solid #334155;
+        }
+
+        textarea {
+            width: 100%;
+            height: 80px;
+            background: #0f172a;
+            color: #38bdf8;
+            border: 1px solid #334155;
+            border-radius: 4px;
+            padding: 8px;
+            font-family: monospace;
+            resize: vertical;
+            box-sizing: border-box;
+        }
+
+        button {
+            background: #0284c7;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+
+        button:hover {
+            background: #0369a1;
+        }
+
+        #chat {
+            height: 200px;
+            overflow-y: auto;
+            background: #0f172a;
+            border: 1px solid #334155;
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 10px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .msg {
+            margin-bottom: 8px;
+            padding: 5px 10px;
+            border-radius: 4px;
+            background: #334155;
+            width: fit-content;
+        }
+
+        .msg.local {
+            background: #075985;
+            align-self: flex-end;
+        }
+
+        .status {
+            color: #94a3b8;
+            font-size: 0.9em;
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>WebRTC C++ Sample</h1>
+
+    <div class="status" id="status">Status: Idle</div>
+
+    <div class="section">
+        <h3>1. SDP Handshake</h3>
+        <p>A. Paste Offer SDP from C++ (then click Set Remote):</p>
+        <textarea id="remoteSdp" placeholder="Paste v=0... here"></textarea>
+        <button onclick="setRemoteDescription()">Set Remote Description & Create Answer</button>
+
+        <p style="margin-top:20px">B. Your Answer SDP (Copy this back to C++ 'sdp3'):</p>
+        <textarea id="localSdp" readonly onclick="this.select()"></textarea>
+    </div>
+
+    <div class="section">
+        <h3>2. ICE Candidates</h3>
+        <p>A. Paste ICE JSON from C++ (then click Add):</p>
+        <textarea id="remoteIce" placeholder="Paste [...] here"></textarea>
+        <button onclick="addIceCandidate()">Add ICE Candidates</button>
+
+        <p style="margin-top:20px">B. Your ICE Candidates (Copy these to C++ 'ice2'):</p>
+        <textarea id="localIce" readonly onclick="this.select()"></textarea>
+    </div>
+
+    <div class="section">
+        <h3>3. Data Channel Chat</h3>
+        <div id="chat"></div>
+        <input type="text" id="messageInput"
+            style="width:70%; padding:8px; background:#0f172a; border:1px solid #334155; color:white; border-radius:4px;"
+            placeholder="Type a message...">
+        <button onclick="sendMessage()">Send</button>
+    </div>
+
+    <script>
+        const pc = new RTCPeerConnection({
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        });
+
+        let dataChannel;
+        const localIceList = [];
+
+        pc.onicecandidate = (event) => {
+            if (event.candidate) {
+                localIceList.push({
+                    candidate: event.candidate.candidate,
+                    sdp_mid: event.candidate.sdpMid,
+                    sdp_mline_index: event.candidate.sdpMLineIndex
+                });
+                document.getElementById('localIce').value = JSON.stringify(localIceList);
+            }
+        };
+
+        pc.ondatachannel = (event) => {
+            setupDataChannel(event.channel);
+        };
+
+        function setupDataChannel(channel) {
+            dataChannel = channel;
+            dataChannel.onopen = () => updateStatus('Connected');
+            dataChannel.onclose = () => updateStatus('Disconnected');
+            dataChannel.onmessage = (event) => appendMessage(event.data, 'remote');
+        }
+
+        async function setRemoteDescription() {
+            let sdp = document.getElementById('remoteSdp').value;
+
+            // Clean common terminal artifacts
+            sdp = sdp.replace(/--- SDP START ---/g, '')
+                .replace(/--- SDP END ---/g, '')
+                .trim();
+
+            // Normalize line endings to CRLF (\r\n) as required by strict SDP parsers
+            sdp = sdp.split(/\r?\n/).filter(line => line.trim() !== '').join('\r\n') + '\r\n';
+
+            try {
+                await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: sdp }));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                document.getElementById('localSdp').value = answer.sdp;
+                updateStatus('Answer Created');
+            } catch (e) {
+                console.error('SDP Error:', e);
+                updateStatus('Error: ' + e.message);
+                alert('Failed to set SDP. Check the console for details.');
+            }
+        }
+
+        function addIceCandidate() {
+            let iceText = document.getElementById('remoteIce').value;
+
+            // Clean common terminal artifacts
+            iceText = iceText.replace(/--- ICE CANDIDATES START ---/g, '')
+                .replace(/--- ICE CANDIDATES END ---/g, '')
+                .trim();
+
+            try {
+                const candidates = JSON.parse(iceText);
+                candidates.forEach(c => {
+                    pc.addIceCandidate(new RTCIceCandidate({
+                        candidate: c.candidate,
+                        sdpMid: c.sdp_mid,
+                        sdpMLineIndex: c.sdp_mline_index
+                    }));
+                });
+                updateStatus('ICE Added');
+            } catch (e) {
+                console.error('ICE Error:', e);
+                updateStatus('Error parsing ICE JSON');
+            }
+        }
+
+        function sendMessage() {
+            const input = document.getElementById('messageInput');
+            if (dataChannel && dataChannel.readyState === 'open') {
+                dataChannel.send(input.value);
+                appendMessage(input.value, 'local');
+                input.value = '';
+            }
+        }
+
+        function appendMessage(text, side) {
+            const div = document.createElement('div');
+            div.className = 'msg ' + side;
+            div.textContent = text;
+            document.getElementById('chat').appendChild(div);
+            document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
+        }
+
+        function updateStatus(text) {
+            document.getElementById('status').textContent = 'Status: ' + text;
+        }
+    </script>
+</body>
+
+</html>
